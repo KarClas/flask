@@ -6,13 +6,15 @@ import uuid
 import weakref
 from contextlib import nullcontext
 from datetime import datetime
-from datetime import timezone
+from datetime import UTC
+from functools import partial
 from platform import python_implementation
 
 import pytest
 import werkzeug.serving
 from markupsafe import Markup
 from werkzeug.exceptions import BadRequest
+from werkzeug.exceptions import BadRequestKeyError
 from werkzeug.exceptions import Forbidden
 from werkzeug.exceptions import NotFound
 from werkzeug.http import parse_date
@@ -52,10 +54,12 @@ def test_options_on_multiple_rules(app, client):
     assert sorted(rv.allow) == ["GET", "HEAD", "OPTIONS", "POST", "PUT"]
 
 
-@pytest.mark.parametrize("method", ["get", "post", "put", "delete", "patch"])
+@pytest.mark.parametrize("method", ["get", "query", "post", "put", "delete", "patch"])
 def test_method_route(app, client, method):
     method_route = getattr(app, method)
-    client_method = getattr(client, method)
+    client_method = getattr(
+        client, method, partial(client.open, method=method.capitalize())
+    )
 
     @method_route("/")
     def hello():
@@ -435,7 +439,7 @@ def test_session_expiration(app, client):
     assert "set-cookie" in rv.headers
     match = re.search(r"(?i)\bexpires=([^;]+)", rv.headers["set-cookie"])
     expires = parse_date(match.group())
-    expected = datetime.now(timezone.utc) + app.permanent_session_lifetime
+    expected = datetime.now(UTC) + app.permanent_session_lifetime
     assert expires.year == expected.year
     assert expires.month == expected.month
     assert expires.day == expected.day
@@ -465,7 +469,7 @@ def test_session_stored_last(app, client):
 
 
 def test_session_special_types(app, client):
-    now = datetime.now(timezone.utc).replace(microsecond=0)
+    now = datetime.now(UTC).replace(microsecond=0)
     the_uuid = uuid.uuid4()
 
     @app.route("/")
@@ -1069,11 +1073,10 @@ def test_trap_bad_request_key_error(app, client, debug, trap, expect_key, expect
         assert rv.status_code == 400
         assert b"missing_key" not in rv.data
     else:
-        with pytest.raises(KeyError) as exc_info:
+        with pytest.raises(BadRequestKeyError) as exc_info:
             client.get("/key")
 
-        assert exc_info.errisinstance(BadRequest)
-        assert "missing_key" in exc_info.value.get_description()
+        assert "missing_key" in exc_info.value.get_response().get_data(as_text=True)
 
     if expect_abort:
         rv = client.get("/abort")

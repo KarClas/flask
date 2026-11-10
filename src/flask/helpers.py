@@ -445,8 +445,8 @@ def send_file(
 
     :param path_or_file: The path to the file to send, relative to the
         current working directory if a relative path is given.
-        Alternatively, a file-like object opened in binary mode. Make
-        sure the file pointer is seeked to the start of the data.
+        Alternatively, a file-like object opened in binary mode; make
+        sure to call ``seek(0)`` if it was already read.
     :param mimetype: The MIME type to send for the file. If not
         provided, it will try to detect it from the file name.
     :param as_attachment: Indicate to a browser that it should offer to
@@ -676,7 +676,4 @@ class _CollectErrors:
     def raise_any(self, message: str) -> None:
         """Raise if any errors were collected."""
         if self.errors:
-            if sys.version_info >= (3, 11):
-                raise BaseExceptionGroup(message, self.errors)  # noqa: F821
-            else:
-                raise self.errors[0]
+            raise BaseExceptionGroup(message, self.errors)
