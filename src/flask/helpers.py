@@ -7,6 +7,7 @@ import typing as t
 from datetime import datetime
 from functools import cache
 from functools import update_wrapper
+from types import TracebackType
 
 import werkzeug.utils
 from werkzeug.exceptions import abort as _wz_abort
@@ -14,10 +15,9 @@ from werkzeug.utils import redirect as _wz_redirect
 from werkzeug.wrappers import Response as BaseResponse
 
 from .globals import _cv_app
-from .globals import _cv_request
+from .globals import app_ctx
 from .globals import current_app
 from .globals import request
-from .globals import request_ctx
 from .globals import session
 from .signals import message_flashed
 
@@ -64,7 +64,7 @@ def stream_with_context(
     generator_or_function: t.Iterator[t.AnyStr] | t.Callable[..., t.Iterator[t.AnyStr]],
 ) -> t.Iterator[t.AnyStr] | t.Callable[[t.Iterator[t.AnyStr]], t.Iterator[t.AnyStr]]:
     """Wrap a response generator function so that it runs inside the current
-    request context. This keeps :data:`request`, :data:`session`, and :data:`g`
+    request context. This keeps :data:`.request`, :data:`.session`, and :data:`.g`
     available, even though at the point the generator runs the request context
     will typically have ended.
 
@@ -124,22 +124,15 @@ def stream_with_context(
         return update_wrapper(decorator, generator_or_function)  # type: ignore[arg-type]
 
     def generator() -> t.Iterator[t.AnyStr]:
-        if (req_ctx := _cv_request.get(None)) is None:
+        if (ctx := _cv_app.get(None)) is None:
             raise RuntimeError(
                 "'stream_with_context' can only be used when a request"
                 " context is active, such as in a view function."
             )
 
-        app_ctx = _cv_app.get()
-        # Setup code below will run the generator to this point, so that the
-        # current contexts are recorded. The contexts must be pushed after,
-        # otherwise their ContextVar will record the wrong event loop during
-        # async view functions.
-        yield None  # type: ignore[misc]
+        with ctx:
+            yield None  # type: ignore[misc]
 
-        # Push the app context first, so that the request context does not
-        # automatically create and push a different app context.
-        with app_ctx, req_ctx:
             try:
                 yield from gen
             finally:
@@ -147,9 +140,9 @@ def stream_with_context(
                 if hasattr(gen, "close"):
                     gen.close()
 
-    # Execute the generator to the sentinel value. This ensures the context is
-    # preserved in the generator's state. Further iteration will push the
-    # context and yield from the original iterator.
+    # Execute the generator to the sentinel value. This captures the current
+    # context and pushes it to preserve it. Further iteration will yield from
+    # the original iterator.
     wrapped_g = generator()
     next(wrapped_g)
     return wrapped_g
@@ -259,7 +252,7 @@ def url_for(
 
 
 def redirect(
-    location: str, code: int = 302, Response: type[BaseResponse] | None = None
+    location: str, code: int = 303, Response: type[BaseResponse] | None = None
 ) -> BaseResponse:
     """Create a redirect response object.
 
@@ -272,12 +265,15 @@ def redirect(
     :param Response: The response class to use. Not used when
         ``current_app`` is active, which uses ``app.response_class``.
 
+    .. versionchanged:: 3.2
+        ``code`` defaults to ``303`` instead of ``302``.
+
     .. versionadded:: 2.2
         Calls ``current_app.redirect`` if available instead of always
         using Werkzeug's default ``redirect``.
     """
-    if current_app:
-        return current_app.redirect(location, code=code)
+    if (ctx := _cv_app.get(None)) is not None:
+        return ctx.app.redirect(location, code=code)
 
     return _wz_redirect(location, code=code, Response=Response)
 
@@ -299,8 +295,8 @@ def abort(code: int | BaseResponse, *args: t.Any, **kwargs: t.Any) -> t.NoReturn
         Calls ``current_app.aborter`` if available instead of always
         using Werkzeug's default ``abort``.
     """
-    if current_app:
-        current_app.aborter(code, *args, **kwargs)
+    if (ctx := _cv_app.get(None)) is not None:
+        ctx.app.aborter(code, *args, **kwargs)
 
     _wz_abort(code, *args, **kwargs)
 
@@ -352,7 +348,7 @@ def flash(message: str, category: str = "message") -> None:
     flashes = session.get("_flashes", [])
     flashes.append((category, message))
     session["_flashes"] = flashes
-    app = current_app._get_current_object()  # type: ignore
+    app = current_app._get_current_object()
     message_flashed.send(
         app,
         _async_wrapper=app.ensure_sync,
@@ -392,10 +388,10 @@ def get_flashed_messages(
     :param category_filter: filter of categories to limit return values.  Only
                             categories in the list will be returned.
     """
-    flashes = request_ctx.flashes
+    flashes = app_ctx._flashes
     if flashes is None:
         flashes = session.pop("_flashes") if "_flashes" in session else []
-        request_ctx.flashes = flashes
+        app_ctx._flashes = flashes
     if category_filter:
         flashes = list(filter(lambda f: f[0] in category_filter, flashes))
     if not with_categories:
@@ -404,14 +400,16 @@ def get_flashed_messages(
 
 
 def _prepare_send_file_kwargs(**kwargs: t.Any) -> dict[str, t.Any]:
+    ctx = app_ctx._get_current_object()
+
     if kwargs.get("max_age") is None:
-        kwargs["max_age"] = current_app.get_send_file_max_age
+        kwargs["max_age"] = ctx.app.get_send_file_max_age
 
     kwargs.update(
-        environ=request.environ,
-        use_x_sendfile=current_app.config["USE_X_SENDFILE"],
-        response_class=current_app.response_class,
-        _root_path=current_app.root_path,
+        environ=ctx.request.environ,
+        use_x_sendfile=ctx.app.config["USE_X_SENDFILE"],
+        response_class=ctx.app.response_class,
+        _root_path=ctx.app.root_path,
     )
     return kwargs
 
@@ -447,8 +445,8 @@ def send_file(
 
     :param path_or_file: The path to the file to send, relative to the
         current working directory if a relative path is given.
-        Alternatively, a file-like object opened in binary mode. Make
-        sure the file pointer is seeked to the start of the data.
+        Alternatively, a file-like object opened in binary mode; make
+        sure to call ``seek(0)`` if it was already read.
     :param mimetype: The MIME type to send for the file. If not
         provided, it will try to detect it from the file name.
     :param as_attachment: Indicate to a browser that it should offer to
@@ -651,3 +649,31 @@ def _split_blueprint_path(name: str) -> list[str]:
         out.extend(_split_blueprint_path(name.rpartition(".")[0]))
 
     return out
+
+
+class _CollectErrors:
+    """A context manager that records and silences an error raised within it.
+    Used to run all teardown functions, then raise any errors afterward.
+    """
+
+    def __init__(self) -> None:
+        self.errors: list[BaseException] = []
+
+    def __enter__(self) -> None:
+        pass
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> bool:
+        if exc_val is not None:
+            self.errors.append(exc_val)
+
+        return True
+
+    def raise_any(self, message: str) -> None:
+        """Raise if any errors were collected."""
+        if self.errors:
+            raise BaseExceptionGroup(message, self.errors)

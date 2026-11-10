@@ -301,6 +301,14 @@ class Scaffold:
         return self._method_route("GET", rule, options)
 
     @setupmethod
+    def query(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]:
+        """Shortcut for :meth:`route` with ``methods=["QUERY"]``.
+
+        .. versionadded:: 3.2
+        """
+        return self._method_route("QUERY", rule, options)
+
+    @setupmethod
     def post(self, rule: str, **options: t.Any) -> t.Callable[[T_route], T_route]:
         """Shortcut for :meth:`route` with ``methods=["POST"]``.
 
@@ -507,8 +515,8 @@ class Scaffold:
     @setupmethod
     def teardown_request(self, f: T_teardown) -> T_teardown:
         """Register a function to be called when the request context is
-        popped. Typically this happens at the end of each request, but
-        contexts may be pushed manually as well during testing.
+        popped. Typically, this happens at the end of each request, but
+        contexts may be pushed manually during testing.
 
         .. code-block:: python
 

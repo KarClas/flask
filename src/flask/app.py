@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import collections.abc as cabc
+import inspect
 import os
 import sys
 import typing as t
 import weakref
 from datetime import timedelta
+from functools import update_wrapper
 from inspect import iscoroutinefunction
 from itertools import chain
 from types import TracebackType
 from urllib.parse import quote as _url_quote
+from urllib.parse import urlsplit
 
 import click
 from werkzeug.datastructures import Headers
-from werkzeug.datastructures import ImmutableDict
 from werkzeug.exceptions import BadRequestKeyError
 from werkzeug.exceptions import HTTPException
 from werkzeug.exceptions import InternalServerError
@@ -24,25 +26,21 @@ from werkzeug.routing import RoutingException
 from werkzeug.routing import Rule
 from werkzeug.serving import is_running_from_reloader
 from werkzeug.wrappers import Response as BaseResponse
-from werkzeug.wsgi import get_host
 
 from . import cli
 from . import typing as ft
 from .ctx import AppContext
-from .ctx import RequestContext
 from .globals import _cv_app
-from .globals import _cv_request
-from .globals import current_app
+from .globals import app_ctx
 from .globals import g
 from .globals import request
-from .globals import request_ctx
 from .globals import session
+from .helpers import _CollectErrors
 from .helpers import get_debug_flag
 from .helpers import get_flashed_messages
 from .helpers import get_load_dotenv
 from .helpers import send_from_directory
 from .sansio.app import App
-from .sansio.scaffold import _sentinel
 from .sessions import SecureCookieSessionInterface
 from .sessions import SessionInterface
 from .signals import appcontext_tearing_down
@@ -76,6 +74,35 @@ def _make_timedelta(value: timedelta | int | None) -> timedelta | None:
         return value
 
     return timedelta(seconds=value)
+
+
+F = t.TypeVar("F", bound=t.Callable[..., t.Any])
+
+
+# Other methods may call the overridden method with the new ctx arg. Remove it
+# and call the method with the remaining args.
+def remove_ctx(f: F) -> F:
+    def wrapper(self: Flask, *args: t.Any, **kwargs: t.Any) -> t.Any:
+        if args and isinstance(args[0], AppContext):
+            args = args[1:]
+
+        return f(self, *args, **kwargs)
+
+    return update_wrapper(wrapper, f)  # type: ignore[return-value]
+
+
+# The overridden method may call super().base_method without the new ctx arg.
+# Add it to the args for the call.
+def add_ctx(f: F) -> F:
+    def wrapper(self: Flask, *args: t.Any, **kwargs: t.Any) -> t.Any:
+        if not args:
+            args = (app_ctx._get_current_object(),)
+        elif not isinstance(args[0], AppContext):
+            args = (app_ctx._get_current_object(), *args)
+
+        return f(self, *args, **kwargs)
+
+    return update_wrapper(wrapper, f)  # type: ignore[return-value]
 
 
 class Flask(App):
@@ -175,39 +202,37 @@ class Flask(App):
         automatically, such as for namespace packages.
     """
 
-    default_config = ImmutableDict(
-        {
-            "DEBUG": None,
-            "TESTING": False,
-            "PROPAGATE_EXCEPTIONS": None,
-            "SECRET_KEY": None,
-            "SECRET_KEY_FALLBACKS": None,
-            "PERMANENT_SESSION_LIFETIME": timedelta(days=31),
-            "USE_X_SENDFILE": False,
-            "TRUSTED_HOSTS": None,
-            "SERVER_NAME": None,
-            "APPLICATION_ROOT": "/",
-            "SESSION_COOKIE_NAME": "session",
-            "SESSION_COOKIE_DOMAIN": None,
-            "SESSION_COOKIE_PATH": None,
-            "SESSION_COOKIE_HTTPONLY": True,
-            "SESSION_COOKIE_SECURE": False,
-            "SESSION_COOKIE_PARTITIONED": False,
-            "SESSION_COOKIE_SAMESITE": None,
-            "SESSION_REFRESH_EACH_REQUEST": True,
-            "MAX_CONTENT_LENGTH": None,
-            "MAX_FORM_MEMORY_SIZE": 500_000,
-            "MAX_FORM_PARTS": 1_000,
-            "SEND_FILE_MAX_AGE_DEFAULT": None,
-            "TRAP_BAD_REQUEST_ERRORS": None,
-            "TRAP_HTTP_EXCEPTIONS": False,
-            "EXPLAIN_TEMPLATE_LOADING": False,
-            "PREFERRED_URL_SCHEME": "http",
-            "TEMPLATES_AUTO_RELOAD": None,
-            "MAX_COOKIE_SIZE": 4093,
-            "PROVIDE_AUTOMATIC_OPTIONS": True,
-        }
-    )
+    default_config: cabc.Mapping[str, t.Any] = {
+        "DEBUG": None,
+        "TESTING": False,
+        "PROPAGATE_EXCEPTIONS": None,
+        "SECRET_KEY": None,
+        "SECRET_KEY_FALLBACKS": None,
+        "PERMANENT_SESSION_LIFETIME": timedelta(days=31),
+        "USE_X_SENDFILE": False,
+        "TRUSTED_HOSTS": None,
+        "SERVER_NAME": None,
+        "APPLICATION_ROOT": "/",
+        "SESSION_COOKIE_NAME": "session",
+        "SESSION_COOKIE_DOMAIN": None,
+        "SESSION_COOKIE_PATH": None,
+        "SESSION_COOKIE_HTTPONLY": True,
+        "SESSION_COOKIE_SECURE": False,
+        "SESSION_COOKIE_PARTITIONED": False,
+        "SESSION_COOKIE_SAMESITE": None,
+        "SESSION_REFRESH_EACH_REQUEST": True,
+        "MAX_CONTENT_LENGTH": None,
+        "MAX_FORM_MEMORY_SIZE": 500_000,
+        "MAX_FORM_PARTS": 1_000,
+        "SEND_FILE_MAX_AGE_DEFAULT": None,
+        "TRAP_BAD_REQUEST_ERRORS": None,
+        "TRAP_HTTP_EXCEPTIONS": False,
+        "EXPLAIN_TEMPLATE_LOADING": False,
+        "PREFERRED_URL_SCHEME": "http",
+        "TEMPLATES_AUTO_RELOAD": None,
+        "MAX_COOKIE_SIZE": 4093,
+        "PROVIDE_AUTOMATIC_OPTIONS": True,
+    }
 
     #: The class that is used for request objects.  See :class:`~flask.Request`
     #: for more information.
@@ -222,6 +247,63 @@ class Flask(App):
     #:
     #: .. versionadded:: 0.8
     session_interface: SessionInterface = SecureCookieSessionInterface()
+
+    def __init_subclass__(cls, **kwargs: t.Any) -> None:
+        import warnings
+
+        # These method signatures were updated to take a ctx param. Detect
+        # overridden methods in subclasses that still have the old signature.
+        # Show a deprecation warning and wrap to call with correct args.
+        for method in (
+            cls.handle_http_exception,
+            cls.handle_user_exception,
+            cls.handle_exception,
+            cls.log_exception,
+            cls.dispatch_request,
+            cls.full_dispatch_request,
+            cls.finalize_request,
+            cls.make_default_options_response,
+            cls.preprocess_request,
+            cls.process_response,
+            cls.do_teardown_request,
+            cls.do_teardown_appcontext,
+            cls.update_template_context,
+        ):
+            base_method = getattr(Flask, method.__name__)
+
+            if method is base_method:
+                # not overridden
+                continue
+
+            # get the second parameter (first is self)
+            iter_params = iter(inspect.signature(method).parameters.values())
+            next(iter_params)
+            param = next(iter_params, None)
+
+            # must have second parameter named ctx or annotated AppContext
+            if param is None or not (
+                # no annotation, match name
+                (param.annotation is inspect.Parameter.empty and param.name == "ctx")
+                or (
+                    # string annotation, access path ends with AppContext
+                    isinstance(param.annotation, str)
+                    and param.annotation.rpartition(".")[2] == "AppContext"
+                )
+                or (
+                    # class annotation
+                    inspect.isclass(param.annotation)
+                    and issubclass(param.annotation, AppContext)
+                )
+            ):
+                warnings.warn(
+                    f"The '{method.__name__}' method now takes 'ctx: AppContext'"
+                    " as the first parameter. The old signature is deprecated"
+                    " and will not be supported in Flask 4.0.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                setattr(cls, method.__name__, remove_ctx(method))
+                setattr(Flask, method.__name__, add_ctx(base_method))
 
     def __init__(
         self,
@@ -295,7 +377,7 @@ class Flask(App):
 
         .. versionadded:: 0.9
         """
-        value = current_app.config["SEND_FILE_MAX_AGE_DEFAULT"]
+        value = self.config["SEND_FILE_MAX_AGE_DEFAULT"]
 
         if value is None:
             return None
@@ -447,7 +529,7 @@ class Flask(App):
                 request.trusted_hosts = trusted_hosts
 
             # Check trusted_hosts here until bind_to_environ does.
-            request.host = get_host(request.environ, request.trusted_hosts)  # pyright: ignore
+            request.host  # noqa:B018
             subdomain = None
             server_name = self.config["SERVER_NAME"]
 
@@ -461,9 +543,15 @@ class Flask(App):
                 # the empty string.
                 subdomain = self.url_map.default_subdomain or ""
 
-            return self.url_map.bind_to_environ(
-                request.environ, server_name=server_name, subdomain=subdomain
-            )
+            try:
+                return self.url_map.bind_to_request(  # type: ignore[attr-defined,no-any-return]
+                    request, server_name=server_name, subdomain=subdomain
+                )
+            except AttributeError:
+                # Werkzeug < 3.2
+                return self.url_map.bind_to_environ(
+                    request.environ, server_name=server_name, subdomain=subdomain
+                )
 
         # Need at least SERVER_NAME to match/build outside a request.
         if self.config["SERVER_NAME"] is not None:
@@ -503,22 +591,29 @@ class Flask(App):
 
         raise FormDataRoutingRedirect(request)
 
-    def update_template_context(self, context: dict[str, t.Any]) -> None:
+    def update_template_context(
+        self, ctx: AppContext, context: dict[str, t.Any]
+    ) -> None:
         """Update the template context with some commonly used variables.
         This injects request, session, config and g into the template
         context as well as everything template context processors want
-        to inject.  Note that the as of Flask 0.6, the original values
-        in the context will not be overridden if a context processor
-        decides to return a value with the same key.
+        to inject.
 
-        :param context: the context as a dictionary that is updated in place
-                        to add extra variables.
+        :param ctx: The current app context.
+        :param context: The context dict that will be passed to the template.
+
+        .. versionchanged:: 3.2
+            Takes ``ctx: AppContext`` as the first parameter. The old signature
+            is deprecated and will not be supported in Flask 4.0.
+
+        .. versionchanged:: 0.6
+            Context keys passed to ``render_template`` are not overwritten.
         """
         names: t.Iterable[str | None] = (None,)
 
         # A template may be rendered outside a request context.
-        if request:
-            names = chain(names, reversed(request.blueprints))
+        if ctx.has_request:
+            names = chain(names, reversed(ctx.request.blueprints))
 
         # The values passed to render_template take precedence. Keep a
         # copy to re-apply after all context functions.
@@ -635,7 +730,9 @@ class Flask(App):
         sn_host = sn_port = None
 
         if server_name:
-            sn_host, _, sn_port = server_name.partition(":")
+            server_url = urlsplit(f"//{server_name}")
+            sn_host = server_url.hostname
+            sn_port = server_url.port
 
         if not host:
             if sn_host:
@@ -645,8 +742,8 @@ class Flask(App):
 
         if port or port == 0:
             port = int(port)
-        elif sn_port:
-            port = int(sn_port)
+        elif sn_port is not None:
+            port = sn_port
         else:
             port = 5000
 
@@ -659,7 +756,7 @@ class Flask(App):
         from werkzeug.serving import run_simple
 
         try:
-            run_simple(t.cast(str, host), port, self, **options)
+            run_simple(host, port, self, **options)
         finally:
             # reset the first request information if the development server
             # reset normally.  This makes it possible to restart the server
@@ -742,11 +839,15 @@ class Flask(App):
         return cls(self, **kwargs)  # type: ignore
 
     def handle_http_exception(
-        self, e: HTTPException
+        self, ctx: AppContext, e: HTTPException
     ) -> HTTPException | ft.ResponseReturnValue:
         """Handles an HTTP exception.  By default this will invoke the
         registered error handlers and fall back to returning the
         exception as response.
+
+        .. versionchanged:: 3.2
+            Takes ``ctx: AppContext`` as the first parameter. The old signature
+            is deprecated and will not be supported in Flask 4.0.
 
         .. versionchanged:: 1.0.3
             ``RoutingException``, used internally for actions such as
@@ -771,13 +872,13 @@ class Flask(App):
         if isinstance(e, RoutingException):
             return e
 
-        handler = self._find_error_handler(e, request.blueprints)
+        handler = self._find_error_handler(e, ctx.request.blueprints)
         if handler is None:
             return e
         return self.ensure_sync(handler)(e)  # type: ignore[no-any-return]
 
     def handle_user_exception(
-        self, e: Exception
+        self, ctx: AppContext, e: Exception
     ) -> HTTPException | ft.ResponseReturnValue:
         """This method is called whenever an exception occurs that
         should be handled. A special case is :class:`~werkzeug
@@ -785,6 +886,10 @@ class Flask(App):
         :meth:`handle_http_exception` method. This function will either
         return a response value or reraise the exception with the same
         traceback.
+
+        .. versionchanged:: 3.2
+            Takes ``ctx: AppContext`` as the first parameter. The old signature
+            is deprecated and will not be supported in Flask 4.0.
 
         .. versionchanged:: 1.0
             Key errors raised from request data like ``form`` show the
@@ -799,16 +904,16 @@ class Flask(App):
             e.show_exception = True
 
         if isinstance(e, HTTPException) and not self.trap_http_exception(e):
-            return self.handle_http_exception(e)
+            return self.handle_http_exception(ctx, e)
 
-        handler = self._find_error_handler(e, request.blueprints)
+        handler = self._find_error_handler(e, ctx.request.blueprints)
 
         if handler is None:
             raise
 
         return self.ensure_sync(handler)(e)  # type: ignore[no-any-return]
 
-    def handle_exception(self, e: Exception) -> Response:
+    def handle_exception(self, ctx: AppContext, e: Exception) -> Response:
         """Handle an exception that did not have an error handler
         associated with it, or that was raised from an error handler.
         This always causes a 500 ``InternalServerError``.
@@ -824,6 +929,10 @@ class Flask(App):
         ``500``, it will be used. For consistency, the handler will
         always receive the ``InternalServerError``. The original
         unhandled exception is available as ``e.original_exception``.
+
+        .. versionchanged:: 3.2
+            Takes ``ctx: AppContext`` as the first parameter. The old signature
+            is deprecated and will not be supported in Flask 4.0.
 
         .. versionchanged:: 1.1.0
             Always passes the ``InternalServerError`` instance to the
@@ -851,42 +960,52 @@ class Flask(App):
 
             raise e
 
-        self.log_exception(exc_info)
+        self.log_exception(ctx, exc_info)
         server_error: InternalServerError | ft.ResponseReturnValue
         server_error = InternalServerError(original_exception=e)
-        handler = self._find_error_handler(server_error, request.blueprints)
+        handler = self._find_error_handler(server_error, ctx.request.blueprints)
 
         if handler is not None:
             server_error = self.ensure_sync(handler)(server_error)
 
-        return self.finalize_request(server_error, from_error_handler=True)
+        return self.finalize_request(ctx, server_error, from_error_handler=True)
 
     def log_exception(
         self,
-        exc_info: (tuple[type, BaseException, TracebackType] | tuple[None, None, None]),
+        ctx: AppContext,
+        exc_info: tuple[type, BaseException, TracebackType] | tuple[None, None, None],
     ) -> None:
         """Logs an exception.  This is called by :meth:`handle_exception`
         if debugging is disabled and right before the handler is called.
         The default implementation logs the exception as error on the
         :attr:`logger`.
 
+        .. versionchanged:: 3.2
+            Takes ``ctx: AppContext`` as the first parameter. The old signature
+            is deprecated and will not be supported in Flask 4.0.
+
         .. versionadded:: 0.8
         """
         self.logger.error(
-            f"Exception on {request.path} [{request.method}]", exc_info=exc_info
+            f"Exception on {ctx.request.path} [{ctx.request.method}]", exc_info=exc_info
         )
 
-    def dispatch_request(self) -> ft.ResponseReturnValue:
+    def dispatch_request(self, ctx: AppContext) -> ft.ResponseReturnValue:
         """Does the request dispatching.  Matches the URL and returns the
         return value of the view or error handler.  This does not have to
         be a response object.  In order to convert the return value to a
         proper response object, call :func:`make_response`.
 
+        .. versionchanged:: 3.2
+            Takes ``ctx: AppContext`` as the first parameter. The old signature
+            is deprecated and will not be supported in Flask 4.0.
+
         .. versionchanged:: 0.7
            This no longer does the exception handling, this code was
            moved to the new :meth:`full_dispatch_request`.
         """
-        req = request_ctx.request
+        req = ctx.request
+
         if req.routing_exception is not None:
             self.raise_routing_exception(req)
         rule: Rule = req.url_rule  # type: ignore[assignment]
@@ -896,31 +1015,47 @@ class Flask(App):
             getattr(rule, "provide_automatic_options", False)
             and req.method == "OPTIONS"
         ):
-            return self.make_default_options_response()
+            return self.make_default_options_response(ctx)
         # otherwise dispatch to the handler for that endpoint
         view_args: dict[str, t.Any] = req.view_args  # type: ignore[assignment]
         return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
 
-    def full_dispatch_request(self) -> Response:
+    def full_dispatch_request(self, ctx: AppContext) -> Response:
         """Dispatches the request and on top of that performs request
         pre and postprocessing as well as HTTP exception catching and
         error handling.
 
+        .. versionchanged:: 3.2
+            Takes ``ctx: AppContext`` as the first parameter. The old signature
+            is deprecated and will not be supported in Flask 4.0.
+
         .. versionadded:: 0.7
         """
+        if not self._got_first_request and self.should_ignore_error is not None:
+            import warnings
+
+            warnings.warn(
+                "The 'should_ignore_error' method is deprecated and will"
+                " be removed in Flask 3.3. Handle errors as needed in"
+                " teardown handlers instead.",
+                DeprecationWarning,
+                stacklevel=1,
+            )
+
         self._got_first_request = True
 
         try:
             request_started.send(self, _async_wrapper=self.ensure_sync)
-            rv = self.preprocess_request()
+            rv = self.preprocess_request(ctx)
             if rv is None:
-                rv = self.dispatch_request()
+                rv = self.dispatch_request(ctx)
         except Exception as e:
-            rv = self.handle_user_exception(e)
-        return self.finalize_request(rv)
+            rv = self.handle_user_exception(ctx, e)
+        return self.finalize_request(ctx, rv)
 
     def finalize_request(
         self,
+        ctx: AppContext,
         rv: ft.ResponseReturnValue | HTTPException,
         from_error_handler: bool = False,
     ) -> Response:
@@ -934,11 +1069,15 @@ class Flask(App):
         with the `from_error_handler` flag.  If enabled, failures in
         response processing will be logged and otherwise ignored.
 
-        :internal:
+        .. versionchanged:: 3.2
+            Takes ``ctx: AppContext`` as the first parameter. The old signature
+            is deprecated and will not be supported in Flask 4.0.
+
+        :meta private:
         """
         response = self.make_response(rv)
         try:
-            response = self.process_response(response)
+            response = self.process_response(ctx, response)
             request_finished.send(
                 self, _async_wrapper=self.ensure_sync, response=response
             )
@@ -950,15 +1089,18 @@ class Flask(App):
             )
         return response
 
-    def make_default_options_response(self) -> Response:
+    def make_default_options_response(self, ctx: AppContext) -> Response:
         """This method is called to create the default ``OPTIONS`` response.
         This can be changed through subclassing to change the default
         behavior of ``OPTIONS`` responses.
 
+        .. versionchanged:: 3.2
+            Takes ``ctx: AppContext`` as the first parameter. The old signature
+            is deprecated and will not be supported in Flask 4.0.
+
         .. versionadded:: 0.7
         """
-        adapter = request_ctx.url_adapter
-        methods = adapter.allowed_methods()  # type: ignore[union-attr]
+        methods = ctx.url_adapter.allowed_methods()  # type: ignore[union-attr]
         rv = self.response_class()
         rv.allow.update(methods)
         return rv
@@ -1057,11 +1199,9 @@ class Flask(App):
         .. versionadded:: 2.2
             Moved from ``flask.url_for``, which calls this method.
         """
-        req_ctx = _cv_request.get(None)
-
-        if req_ctx is not None:
-            url_adapter = req_ctx.url_adapter
-            blueprint_name = req_ctx.request.blueprint
+        if (ctx := _cv_app.get(None)) is not None and ctx.has_request:
+            url_adapter = ctx.url_adapter
+            blueprint_name = ctx.request.blueprint
 
             # If the endpoint starts with "." and the request matches a
             # blueprint, the endpoint is relative to the blueprint.
@@ -1076,13 +1216,11 @@ class Flask(App):
             if _external is None:
                 _external = _scheme is not None
         else:
-            app_ctx = _cv_app.get(None)
-
             # If called by helpers.url_for, an app context is active,
             # use its url_adapter. Otherwise, app.url_for was called
             # directly, build an adapter.
-            if app_ctx is not None:
-                url_adapter = app_ctx.url_adapter
+            if ctx is not None:
+                url_adapter = ctx.url_adapter
             else:
                 url_adapter = self.create_url_adapter(None)
 
@@ -1143,10 +1281,10 @@ class Flask(App):
                 A response object is created with the bytes as the body.
 
             ``dict``
-                A dictionary that will be jsonify'd before being returned.
+                Converted to a JSON response.
 
             ``list``
-                A list that will be jsonify'd before being returned.
+                Converted to a JSON response.
 
             ``generator`` or ``iterator``
                 A generator that returns ``str`` or ``bytes`` to be
@@ -1222,7 +1360,7 @@ class Flask(App):
                 # waiting to do it manually, so that the class can handle any
                 # special logic
                 rv = self.response_class(
-                    rv,  # pyright: ignore
+                    rv,
                     status=status,
                     headers=headers,  # type: ignore[arg-type]
                 )
@@ -1268,7 +1406,7 @@ class Flask(App):
 
         return rv
 
-    def preprocess_request(self) -> ft.ResponseReturnValue | None:
+    def preprocess_request(self, ctx: AppContext) -> ft.ResponseReturnValue | None:
         """Called before the request is dispatched. Calls
         :attr:`url_value_preprocessors` registered with the app and the
         current blueprint (if any). Then calls :attr:`before_request_funcs`
@@ -1277,13 +1415,18 @@ class Flask(App):
         If any :meth:`before_request` handler returns a non-None value, the
         value is handled as if it was the return value from the view, and
         further request handling is stopped.
+
+        .. versionchanged:: 3.2
+            Takes ``ctx: AppContext`` as the first parameter. The old signature
+            is deprecated and will not be supported in Flask 4.0.
         """
-        names = (None, *reversed(request.blueprints))
+        req = ctx.request
+        names = (None, *reversed(req.blueprints))
 
         for name in names:
             if name in self.url_value_preprocessors:
                 for url_func in self.url_value_preprocessors[name]:
-                    url_func(request.endpoint, request.view_args)
+                    url_func(req.endpoint, req.view_args)
 
         for name in names:
             if name in self.before_request_funcs:
@@ -1295,105 +1438,117 @@ class Flask(App):
 
         return None
 
-    def process_response(self, response: Response) -> Response:
+    def process_response(self, ctx: AppContext, response: Response) -> Response:
         """Can be overridden in order to modify the response object
         before it's sent to the WSGI server.  By default this will
         call all the :meth:`after_request` decorated functions.
 
+        :param ctx: The current app context.
+        :param response: The response.
+        :return: The passed in response, or a new ``Response`` object.
+
+        .. versionchanged:: 3.2
+            Takes ``ctx: AppContext`` as the first parameter. The old signature
+            is deprecated and will not be supported in Flask 4.0.
+
         .. versionchanged:: 0.5
-           As of Flask 0.5 the functions registered for after request
-           execution are called in reverse order of registration.
+            Functions are called in reverse order of registration.
 
-        :param response: a :attr:`response_class` object.
-        :return: a new response object or the same, has to be an
-                 instance of :attr:`response_class`.
         """
-        ctx = request_ctx._get_current_object()  # type: ignore[attr-defined]
-
         for func in ctx._after_request_functions:
             response = self.ensure_sync(func)(response)
 
-        for name in chain(request.blueprints, (None,)):
+        for name in chain(ctx.request.blueprints, (None,)):
             if name in self.after_request_funcs:
                 for func in reversed(self.after_request_funcs[name]):
                     response = self.ensure_sync(func)(response)
 
-        if not self.session_interface.is_null_session(ctx._session):
-            self.session_interface.save_session(self, ctx._session, response)
+        if not self.session_interface.is_null_session(ctx._get_session()):
+            self.session_interface.save_session(self, ctx._get_session(), response)
 
         return response
 
     def do_teardown_request(
-        self,
-        exc: BaseException | None = _sentinel,  # type: ignore[assignment]
+        self, ctx: AppContext, exc: BaseException | None = None
     ) -> None:
-        """Called after the request is dispatched and the response is
-        returned, right before the request context is popped.
+        """Called after the request is dispatched and the response is finalized,
+        right before the request context is popped. Called by
+        :meth:`.AppContext.pop`.
 
-        This calls all functions decorated with
-        :meth:`teardown_request`, and :meth:`Blueprint.teardown_request`
-        if a blueprint handled the request. Finally, the
-        :data:`request_tearing_down` signal is sent.
+        This calls all functions decorated with :meth:`teardown_request`, and
+        :meth:`Blueprint.teardown_request` if a blueprint handled the request.
+        Finally, the :data:`request_tearing_down` signal is sent.
 
-        This is called by
-        :meth:`RequestContext.pop() <flask.ctx.RequestContext.pop>`,
-        which may be delayed during testing to maintain access to
-        resources.
+        :param ctx: The current app context.
+        :param exc: An unhandled exception raised while dispatching the request.
+            Passed to each teardown function.
 
-        :param exc: An unhandled exception raised while dispatching the
-            request. Detected from the current exception information if
-            not passed. Passed to each teardown function.
+        .. versionchanged:: 3.2
+            All callbacks are called rather than stopping on the first error.
+
+        .. versionchanged:: 3.2
+            Takes ``ctx: AppContext`` as the first parameter. The old signature
+            is deprecated and will not be supported in Flask 4.0.
 
         .. versionchanged:: 0.9
             Added the ``exc`` argument.
         """
-        if exc is _sentinel:
-            exc = sys.exc_info()[1]
+        collect_errors = _CollectErrors()
 
-        for name in chain(request.blueprints, (None,)):
+        for name in chain(ctx.request.blueprints, (None,)):
             if name in self.teardown_request_funcs:
                 for func in reversed(self.teardown_request_funcs[name]):
-                    self.ensure_sync(func)(exc)
+                    with collect_errors:
+                        self.ensure_sync(func)(exc)
 
-        request_tearing_down.send(self, _async_wrapper=self.ensure_sync, exc=exc)
+        with collect_errors:
+            request_tearing_down.send(self, _async_wrapper=self.ensure_sync, exc=exc)
+
+        collect_errors.raise_any("Errors during request teardown")
 
     def do_teardown_appcontext(
-        self,
-        exc: BaseException | None = _sentinel,  # type: ignore[assignment]
+        self, ctx: AppContext, exc: BaseException | None = None
     ) -> None:
-        """Called right before the application context is popped.
+        """Called right before the application context is popped. Called by
+        :meth:`.AppContext.pop`.
 
-        When handling a request, the application context is popped
-        after the request context. See :meth:`do_teardown_request`.
+        This calls all functions decorated with :meth:`teardown_appcontext`.
+        Then the :data:`appcontext_tearing_down` signal is sent.
 
-        This calls all functions decorated with
-        :meth:`teardown_appcontext`. Then the
-        :data:`appcontext_tearing_down` signal is sent.
+        :param ctx: The current app context.
+        :param exc: An unhandled exception raised while the context was active.
+            Passed to each teardown function.
 
-        This is called by
-        :meth:`AppContext.pop() <flask.ctx.AppContext.pop>`.
+        .. versionchanged:: 3.2
+            All callbacks are called rather than stopping on the first error.
+
+        .. versionchanged:: 3.2
+            Takes ``ctx: AppContext`` as the first parameter. The old signature
+            is deprecated and will not be supported in Flask 4.0.
 
         .. versionadded:: 0.9
         """
-        if exc is _sentinel:
-            exc = sys.exc_info()[1]
+        collect_errors = _CollectErrors()
 
         for func in reversed(self.teardown_appcontext_funcs):
-            self.ensure_sync(func)(exc)
+            with collect_errors:
+                self.ensure_sync(func)(exc)
 
-        appcontext_tearing_down.send(self, _async_wrapper=self.ensure_sync, exc=exc)
+        with collect_errors:
+            appcontext_tearing_down.send(self, _async_wrapper=self.ensure_sync, exc=exc)
+
+        collect_errors.raise_any("Errors during app teardown")
 
     def app_context(self) -> AppContext:
-        """Create an :class:`~flask.ctx.AppContext`. Use as a ``with``
-        block to push the context, which will make :data:`current_app`
-        point at this application.
+        """Create an :class:`.AppContext`. When the context is pushed,
+        :data:`.current_app` and :data:`.g` become available.
 
-        An application context is automatically pushed by
-        :meth:`RequestContext.push() <flask.ctx.RequestContext.push>`
-        when handling a request, and when running a CLI command. Use
-        this to manually create a context outside of these situations.
+        A context is automatically pushed when handling each request, and when
+        running any ``flask`` CLI command. Use this as a ``with`` block to
+        manually push a context outside of those situations, such as during
+        setup or testing.
 
-        ::
+        .. code-block:: python
 
             with app.app_context():
                 init_db()
@@ -1404,44 +1559,37 @@ class Flask(App):
         """
         return AppContext(self)
 
-    def request_context(self, environ: WSGIEnvironment) -> RequestContext:
-        """Create a :class:`~flask.ctx.RequestContext` representing a
-        WSGI environment. Use a ``with`` block to push the context,
-        which will make :data:`request` point at this request.
+    def request_context(self, environ: WSGIEnvironment) -> AppContext:
+        """Create an :class:`.AppContext` with request information representing
+        the given WSGI environment. A context is automatically pushed when
+        handling each request. When the context is pushed, :data:`.request`,
+        :data:`.session`, :data:`g`, and :data:`.current_app` become available.
 
-        See :doc:`/reqcontext`.
+        This method should not be used in your own code. Creating a valid WSGI
+        environ is not trivial. Use :meth:`test_request_context` to correctly
+        create a WSGI environ and request context instead.
 
-        Typically you should not call this from your own code. A request
-        context is automatically pushed by the :meth:`wsgi_app` when
-        handling a request. Use :meth:`test_request_context` to create
-        an environment and context instead of this method.
+        See :doc:`/appcontext`.
 
-        :param environ: a WSGI environment
+        :param environ: A WSGI environment.
         """
-        return RequestContext(self, environ)
+        return AppContext.from_environ(self, environ)
 
-    def test_request_context(self, *args: t.Any, **kwargs: t.Any) -> RequestContext:
-        """Create a :class:`~flask.ctx.RequestContext` for a WSGI
-        environment created from the given values. This is mostly useful
-        during testing, where you may want to run a function that uses
-        request data without dispatching a full request.
+    def test_request_context(self, *args: t.Any, **kwargs: t.Any) -> AppContext:
+        """Create an :class:`.AppContext` with request information created from
+        the given arguments. When the context is pushed, :data:`.request`,
+        :data:`.session`, :data:`g`, and :data:`.current_app` become available.
 
-        See :doc:`/reqcontext`.
+        This is useful during testing to run a function that uses request data
+        without dispatching a full request. Use this as a ``with`` block to push
+        a context.
 
-        Use a ``with`` block to push the context, which will make
-        :data:`request` point at the request for the created
-        environment. ::
+        .. code-block:: python
 
             with app.test_request_context(...):
                 generate_report()
 
-        When using the shell, it may be easier to push and pop the
-        context manually to avoid indentation. ::
-
-            ctx = app.test_request_context(...)
-            ctx.push()
-            ...
-            ctx.pop()
+        See :doc:`/appcontext`.
 
         Takes the same arguments as Werkzeug's
         :class:`~werkzeug.test.EnvironBuilder`, with some defaults from
@@ -1451,20 +1599,18 @@ class Flask(App):
         :param path: URL path being requested.
         :param base_url: Base URL where the app is being served, which
             ``path`` is relative to. If not given, built from
-            :data:`PREFERRED_URL_SCHEME`, ``subdomain``,
-            :data:`SERVER_NAME`, and :data:`APPLICATION_ROOT`.
-        :param subdomain: Subdomain name to append to
-            :data:`SERVER_NAME`.
+            :data:`PREFERRED_URL_SCHEME`, ``subdomain``, :data:`SERVER_NAME`,
+            and :data:`APPLICATION_ROOT`.
+        :param subdomain: Subdomain name to prepend to :data:`SERVER_NAME`.
         :param url_scheme: Scheme to use instead of
             :data:`PREFERRED_URL_SCHEME`.
-        :param data: The request body, either as a string or a dict of
-            form keys and values.
+        :param data: The request body text or bytes,or a dict of form data.
         :param json: If given, this is serialized as JSON and passed as
             ``data``. Also defaults ``content_type`` to
             ``application/json``.
-        :param args: other positional arguments passed to
+        :param args: Other positional arguments passed to
             :class:`~werkzeug.test.EnvironBuilder`.
-        :param kwargs: other keyword arguments passed to
+        :param kwargs: Other keyword arguments passed to
             :class:`~werkzeug.test.EnvironBuilder`.
         """
         from .testing import EnvironBuilder
@@ -1472,9 +1618,11 @@ class Flask(App):
         builder = EnvironBuilder(self, *args, **kwargs)
 
         try:
-            return self.request_context(builder.get_environ())
+            environ = builder.get_environ()
         finally:
             builder.close()
+
+        return self.request_context(environ)
 
     def wsgi_app(
         self, environ: WSGIEnvironment, start_response: StartResponse
@@ -1496,7 +1644,6 @@ class Flask(App):
             Teardown events for the request and app contexts are called
             even if an unhandled error occurs. Other events may not be
             called depending on when an error occurs during dispatch.
-            See :ref:`callbacks-and-errors`.
 
         :param environ: A WSGI environment.
         :param start_response: A callable accepting a status code,
@@ -1508,20 +1655,23 @@ class Flask(App):
         try:
             try:
                 ctx.push()
-                response = self.full_dispatch_request()
+                response = self.full_dispatch_request(ctx)
             except Exception as e:
                 error = e
-                response = self.handle_exception(e)
+                response = self.handle_exception(ctx, e)
             except:
                 error = sys.exc_info()[1]
                 raise
             return response(environ, start_response)
         finally:
             if "werkzeug.debug.preserve_context" in environ:
-                environ["werkzeug.debug.preserve_context"](_cv_app.get())
-                environ["werkzeug.debug.preserve_context"](_cv_request.get())
+                environ["werkzeug.debug.preserve_context"](ctx)
 
-            if error is not None and self.should_ignore_error(error):
+            if (
+                error is not None
+                and self.should_ignore_error is not None
+                and self.should_ignore_error(error)
+            ):
                 error = None
 
             ctx.pop(error)

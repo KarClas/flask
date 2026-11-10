@@ -468,7 +468,7 @@ _app_option = click.Option(
 def _set_debug(ctx: click.Context, param: click.Option, value: bool) -> bool | None:
     # If the flag isn't provided, it will default to False. Don't use
     # that, let debug be set by env in that case.
-    source = ctx.get_parameter_source(param.name)  # type: ignore[arg-type]
+    source = ctx.get_parameter_source(param.name)
 
     if source is not None and source in (
         ParameterSource.DEFAULT,
@@ -601,15 +601,7 @@ class FlaskGroup(AppGroup):
         if self._loaded_plugin_commands:
             return
 
-        if sys.version_info >= (3, 10):
-            from importlib import metadata
-        else:
-            # Use a backport on Python < 3.10. We technically have
-            # importlib.metadata on 3.8+, but the API changed in 3.10,
-            # so use the backport for consistency.
-            import importlib_metadata as metadata  # pyright: ignore
-
-        for ep in metadata.entry_points(group="flask.commands"):
+        for ep in importlib.metadata.entry_points(group="flask.commands"):
             self.add_command(ep.load(), ep.name)
 
         self._loaded_plugin_commands = True
@@ -636,7 +628,7 @@ class FlaskGroup(AppGroup):
         # Push an app context for the loaded app unless it is already
         # active somehow. This makes the context available to parameter
         # and command callbacks without needing @with_appcontext.
-        if not current_app or current_app._get_current_object() is not app:  # type: ignore[attr-defined]
+        if not current_app or current_app._get_current_object() is not app:
             ctx.with_resource(app.app_context())
 
         return app.cli.get_command(ctx, name)
@@ -785,7 +777,7 @@ def show_server_banner(debug: bool, app_import_path: str | None) -> None:
         click.echo(f" * Debug mode: {'on' if debug else 'off'}")
 
 
-class CertParamType(click.ParamType):
+class CertParamType(click.ParamType):  # type: ignore[type-arg]
     """Click option type for the ``--cert`` option. Allows either an
     existing file, the string ``'adhoc'``, or an import for a
     :class:`~ssl.SSLContext` object.
@@ -811,7 +803,7 @@ class CertParamType(click.ParamType):
         try:
             return self.path_type(value, param, ctx)
         except click.BadParameter:
-            value = click.STRING(value, param, ctx).lower()
+            value = click.STRING(value, param, ctx).lower()  # type: ignore[union-attr]
 
             if value == "adhoc":
                 try:
@@ -882,7 +874,6 @@ class SeparatedPathType(click.Path):
         self, value: t.Any, param: click.Parameter | None, ctx: click.Context | None
     ) -> t.Any:
         items = self.split_envvar_value(value)
-        # can't call no-arg super() inside list comprehension until Python 3.12
         super_convert = super().convert
         return [super_convert(item, param, ctx) for item in items]
 

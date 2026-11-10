@@ -1,6 +1,5 @@
 import pytest
 from jinja2 import TemplateNotFound
-from werkzeug.http import parse_cache_control_header
 
 import flask
 
@@ -184,12 +183,12 @@ def test_templates_and_static(test_apps):
     assert rv.data == b"Hello from the Admin"
     rv = client.get("/admin/index2")
     assert rv.data == b"Hello from the Admin"
-    rv = client.get("/admin/static/test.txt")
-    assert rv.data.strip() == b"Admin File"
-    rv.close()
-    rv = client.get("/admin/static/css/test.css")
-    assert rv.data.strip() == b"/* nested file */"
-    rv.close()
+
+    with client.get("/admin/static/test.txt") as rv:
+        assert rv.data.strip() == b"Admin File"
+
+    with client.get("/admin/static/css/test.css") as rv:
+        assert rv.data.strip() == b"/* nested file */"
 
     # try/finally, in case other tests use this app for Blueprint tests.
     max_age_default = app.config["SEND_FILE_MAX_AGE_DEFAULT"]
@@ -198,10 +197,9 @@ def test_templates_and_static(test_apps):
         if app.config["SEND_FILE_MAX_AGE_DEFAULT"] == expected_max_age:
             expected_max_age = 7200
         app.config["SEND_FILE_MAX_AGE_DEFAULT"] = expected_max_age
-        rv = client.get("/admin/static/css/test.css")
-        cc = parse_cache_control_header(rv.headers["Cache-Control"])
-        assert cc.max_age == expected_max_age
-        rv.close()
+
+        with client.get("/admin/static/css/test.css") as rv:
+            assert rv.cache_control.max_age == expected_max_age
     finally:
         app.config["SEND_FILE_MAX_AGE_DEFAULT"] = max_age_default
 
@@ -220,28 +218,18 @@ def test_templates_and_static(test_apps):
         assert flask.render_template("nested/nested.txt") == "I'm nested"
 
 
-def test_default_static_max_age(app):
+def test_default_static_max_age(app: flask.Flask) -> None:
     class MyBlueprint(flask.Blueprint):
         def get_send_file_max_age(self, filename):
             return 100
 
-    blueprint = MyBlueprint("blueprint", __name__, static_folder="static")
+    blueprint = MyBlueprint(
+        "blueprint", __name__, url_prefix="/bp", static_folder="static"
+    )
     app.register_blueprint(blueprint)
 
-    # try/finally, in case other tests use this app for Blueprint tests.
-    max_age_default = app.config["SEND_FILE_MAX_AGE_DEFAULT"]
-    try:
-        with app.test_request_context():
-            unexpected_max_age = 3600
-            if app.config["SEND_FILE_MAX_AGE_DEFAULT"] == unexpected_max_age:
-                unexpected_max_age = 7200
-            app.config["SEND_FILE_MAX_AGE_DEFAULT"] = unexpected_max_age
-            rv = blueprint.send_static_file("index.html")
-            cc = parse_cache_control_header(rv.headers["Cache-Control"])
-            assert cc.max_age == 100
-            rv.close()
-    finally:
-        app.config["SEND_FILE_MAX_AGE_DEFAULT"] = max_age_default
+    with app.test_request_context(), blueprint.send_static_file("index.html") as rv:
+        assert rv.cache_control.max_age == 100
 
 
 def test_templates_list(test_apps):
@@ -366,10 +354,34 @@ def test_template_filter(app):
     def my_reverse(s):
         return s[::-1]
 
+    @bp.app_template_filter
+    def my_reverse_2(s):
+        return s[::-1]
+
+    @bp.app_template_filter("my_reverse_custom_name_3")
+    def my_reverse_3(s):
+        return s[::-1]
+
+    @bp.app_template_filter(name="my_reverse_custom_name_4")
+    def my_reverse_4(s):
+        return s[::-1]
+
     app.register_blueprint(bp, url_prefix="/py")
     assert "my_reverse" in app.jinja_env.filters.keys()
     assert app.jinja_env.filters["my_reverse"] == my_reverse
     assert app.jinja_env.filters["my_reverse"]("abcd") == "dcba"
+
+    assert "my_reverse_2" in app.jinja_env.filters.keys()
+    assert app.jinja_env.filters["my_reverse_2"] == my_reverse_2
+    assert app.jinja_env.filters["my_reverse_2"]("abcd") == "dcba"
+
+    assert "my_reverse_custom_name_3" in app.jinja_env.filters.keys()
+    assert app.jinja_env.filters["my_reverse_custom_name_3"] == my_reverse_3
+    assert app.jinja_env.filters["my_reverse_custom_name_3"]("abcd") == "dcba"
+
+    assert "my_reverse_custom_name_4" in app.jinja_env.filters.keys()
+    assert app.jinja_env.filters["my_reverse_custom_name_4"] == my_reverse_4
+    assert app.jinja_env.filters["my_reverse_custom_name_4"]("abcd") == "dcba"
 
 
 def test_add_template_filter(app):
@@ -502,10 +514,34 @@ def test_template_test(app):
     def is_boolean(value):
         return isinstance(value, bool)
 
+    @bp.app_template_test
+    def boolean_2(value):
+        return isinstance(value, bool)
+
+    @bp.app_template_test("my_boolean_custom_name")
+    def boolean_3(value):
+        return isinstance(value, bool)
+
+    @bp.app_template_test(name="my_boolean_custom_name_2")
+    def boolean_4(value):
+        return isinstance(value, bool)
+
     app.register_blueprint(bp, url_prefix="/py")
     assert "is_boolean" in app.jinja_env.tests.keys()
     assert app.jinja_env.tests["is_boolean"] == is_boolean
     assert app.jinja_env.tests["is_boolean"](False)
+
+    assert "boolean_2" in app.jinja_env.tests.keys()
+    assert app.jinja_env.tests["boolean_2"] == boolean_2
+    assert app.jinja_env.tests["boolean_2"](False)
+
+    assert "my_boolean_custom_name" in app.jinja_env.tests.keys()
+    assert app.jinja_env.tests["my_boolean_custom_name"] == boolean_3
+    assert app.jinja_env.tests["my_boolean_custom_name"](False)
+
+    assert "my_boolean_custom_name_2" in app.jinja_env.tests.keys()
+    assert app.jinja_env.tests["my_boolean_custom_name_2"] == boolean_4
+    assert app.jinja_env.tests["my_boolean_custom_name_2"](False)
 
 
 def test_add_template_test(app):
@@ -679,6 +715,18 @@ def test_template_global(app):
     def get_answer():
         return 42
 
+    @bp.app_template_global
+    def get_stuff_1():
+        return "get_stuff_1"
+
+    @bp.app_template_global("my_get_stuff_custom_name_2")
+    def get_stuff_2():
+        return "get_stuff_2"
+
+    @bp.app_template_global(name="my_get_stuff_custom_name_3")
+    def get_stuff_3():
+        return "get_stuff_3"
+
     # Make sure the function is not in the jinja_env already
     assert "get_answer" not in app.jinja_env.globals.keys()
     app.register_blueprint(bp)
@@ -688,9 +736,30 @@ def test_template_global(app):
     assert app.jinja_env.globals["get_answer"] is get_answer
     assert app.jinja_env.globals["get_answer"]() == 42
 
+    assert "get_stuff_1" in app.jinja_env.globals.keys()
+    assert app.jinja_env.globals["get_stuff_1"] == get_stuff_1
+    assert app.jinja_env.globals["get_stuff_1"](), "get_stuff_1"
+
+    assert "my_get_stuff_custom_name_2" in app.jinja_env.globals.keys()
+    assert app.jinja_env.globals["my_get_stuff_custom_name_2"] == get_stuff_2
+    assert app.jinja_env.globals["my_get_stuff_custom_name_2"](), "get_stuff_2"
+
+    assert "my_get_stuff_custom_name_3" in app.jinja_env.globals.keys()
+    assert app.jinja_env.globals["my_get_stuff_custom_name_3"] == get_stuff_3
+    assert app.jinja_env.globals["my_get_stuff_custom_name_3"](), "get_stuff_3"
+
     with app.app_context():
         rv = flask.render_template_string("{{ get_answer() }}")
         assert rv == "42"
+
+        rv = flask.render_template_string("{{ get_stuff_1() }}")
+        assert rv == "get_stuff_1"
+
+        rv = flask.render_template_string("{{ my_get_stuff_custom_name_2() }}")
+        assert rv == "get_stuff_2"
+
+        rv = flask.render_template_string("{{ my_get_stuff_custom_name_3() }}")
+        assert rv == "get_stuff_3"
 
 
 def test_request_processing(app, client):

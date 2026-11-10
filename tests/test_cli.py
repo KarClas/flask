@@ -11,7 +11,6 @@ from pathlib import Path
 
 import click
 import pytest
-from _pytest.monkeypatch import notset
 from click.testing import CliRunner
 
 from flask import Blueprint
@@ -462,7 +461,7 @@ class TestRoutes:
 
     def expect_order(self, order, output):
         # skip the header and match the start of each row
-        for expect, line in zip(order, output.splitlines()[2:]):
+        for expect, line in zip(order, output.splitlines()[2:], strict=False):
             # do this instead of startswith for nicer pytest output
             assert line[: len(expect)] == expect
 
@@ -489,6 +488,7 @@ class TestRoutes:
     def test_all_methods(self, invoke):
         output = invoke(["routes"]).output
         assert "GET, HEAD, OPTIONS, POST" not in output
+
         output = invoke(["routes", "--all-methods"]).output
         assert "GET, HEAD, OPTIONS, POST" in output
 
@@ -534,9 +534,8 @@ need_dotenv = pytest.mark.skipif(
 
 @need_dotenv
 def test_load_dotenv(monkeypatch):
-    # can't use monkeypatch.delitem since the keys don't exist yet
     for item in ("FOO", "BAR", "SPAM", "HAM"):
-        monkeypatch._setitem.append((os.environ, item, notset))
+        monkeypatch.delenv(item, False)
 
     monkeypatch.setenv("EGGS", "3")
     monkeypatch.chdir(test_path)
@@ -559,7 +558,7 @@ def test_load_dotenv(monkeypatch):
 @need_dotenv
 def test_dotenv_path(monkeypatch):
     for item in ("FOO", "BAR", "EGGS"):
-        monkeypatch._setitem.append((os.environ, item, notset))
+        monkeypatch.delenv(item, False)
 
     load_dotenv(test_path / ".flaskenv")
     assert Path.cwd() == cwd
@@ -567,6 +566,7 @@ def test_dotenv_path(monkeypatch):
 
 
 def test_dotenv_optional(monkeypatch):
+    monkeypatch.delenv("FOO", False)
     monkeypatch.setitem(sys.modules, "dotenv", None)
     monkeypatch.chdir(test_path)
     load_dotenv()
@@ -575,6 +575,7 @@ def test_dotenv_optional(monkeypatch):
 
 @need_dotenv
 def test_disable_dotenv_from_env(monkeypatch, runner):
+    monkeypatch.delenv("FOO", False)
     monkeypatch.chdir(test_path)
     monkeypatch.setitem(os.environ, "FLASK_SKIP_DOTENV", "1")
     runner.invoke(FlaskGroup())

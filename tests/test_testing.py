@@ -6,7 +6,7 @@ import pytest
 import flask
 from flask import appcontext_popped
 from flask.cli import ScriptInfo
-from flask.globals import _cv_request
+from flask.globals import _cv_app
 from flask.json import jsonify
 from flask.testing import EnvironBuilder
 from flask.testing import FlaskCliRunner
@@ -43,7 +43,7 @@ def test_environ_base_default(app, client):
     @app.route("/")
     def index():
         flask.g.remote_addr = flask.request.remote_addr
-        flask.g.user_agent = flask.request.user_agent.string
+        flask.g.user_agent = str(flask.request.user_agent)
         return ""
 
     with client:
@@ -58,7 +58,7 @@ def test_environ_base_modified(app, client):
     @app.route("/")
     def index():
         flask.g.remote_addr = flask.request.remote_addr
-        flask.g.user_agent = flask.request.user_agent.string
+        flask.g.user_agent = str(flask.request.user_agent)
         return ""
 
     client.environ_base["REMOTE_ADDR"] = "192.168.0.22"
@@ -76,7 +76,6 @@ def test_client_open_environ(app, client, request):
         return flask.request.remote_addr
 
     builder = EnvironBuilder(app, path="/index", method="GET")
-    request.addfinalizer(builder.close)
 
     rv = client.open(builder)
     assert rv.data == b"127.0.0.1"
@@ -170,6 +169,20 @@ def test_session_transactions(app, client):
         with client.session_transaction() as sess:
             assert len(sess) == 1
             assert sess["foo"] == [42]
+
+
+def test_session_transaction_ipv6(app):
+    base_url = "http://[::1]:8000/"
+    client = app.test_client()
+
+    @app.get("/")
+    def index():
+        return str(flask.session.get("value"))
+
+    with client.session_transaction(base_url=base_url) as sess:
+        sess["value"] = 42
+
+    assert client.get("/", base_url=base_url).text == "42"
 
 
 def test_session_transactions_no_null_sessions():
@@ -382,4 +395,4 @@ def test_client_pop_all_preserved(app, req_ctx, client):
     # close the response, releasing the context held by stream_with_context
     rv.close()
     # only req_ctx fixture should still be pushed
-    assert _cv_request.get(None) is req_ctx
+    assert _cv_app.get(None) is req_ctx

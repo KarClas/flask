@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections.abc as cabc
 import logging
 import os
 import sys
@@ -177,11 +178,8 @@ class App(Scaffold):
     #: 3. Return None instead of AttributeError on unexpected attributes.
     #: 4. Raise exception if an unexpected attr is set, a "controlled" flask.g.
     #:
-    #: In Flask 0.9 this property was called `request_globals_class` but it
-    #: was changed in 0.10 to :attr:`app_ctx_globals_class` because the
-    #: flask.g object is now application context scoped.
-    #:
     #: .. versionadded:: 0.10
+    #:     Renamed from ``request_globals_class`.
     app_ctx_globals_class = _AppCtxGlobals
 
     #: The class that is used for the ``config`` attribute of this app.
@@ -213,7 +211,7 @@ class App(Scaffold):
     #:
     #: This attribute can also be configured from the config with the
     #: :data:`SECRET_KEY` configuration key. Defaults to ``None``.
-    secret_key = ConfigAttribute[t.Union[str, bytes, None]]("SECRET_KEY")
+    secret_key = ConfigAttribute[str | bytes | None]("SECRET_KEY")
 
     #: A :class:`~datetime.timedelta` which is used to set the expiration
     #: date of a permanent session.  The default is 31 days which makes a
@@ -276,7 +274,7 @@ class App(Scaffold):
     #: .. versionadded:: 1.0
     test_cli_runner_class: type[FlaskCliRunner] | None = None
 
-    default_config: dict[str, t.Any]
+    default_config: cabc.Mapping[str, t.Any]
     response_class: type[Response]
 
     def __init__(
@@ -537,6 +535,9 @@ class App(Scaffold):
         """Returns ``True`` if autoescaping should be active for the given
         template name. If no template name is given, returns `True`.
 
+        .. versionchanged:: 3.2
+            Use case-insensitive comparison instead of only lower case.
+
         .. versionchanged:: 2.2
             Autoescaping is now enabled by default for ``.svg`` files.
 
@@ -544,7 +545,7 @@ class App(Scaffold):
         """
         if filename is None:
             return True
-        return filename.endswith((".html", ".htm", ".xml", ".xhtml", ".svg"))
+        return filename.lower().endswith((".html", ".htm", ".xml", ".xhtml", ".svg"))
 
     @property
     def debug(self) -> bool:
@@ -630,19 +631,19 @@ class App(Scaffold):
         # Methods that should always be added
         required_methods: set[str] = set(getattr(view_func, "required_methods", ()))
 
-        # starting with Flask 0.8 the view_func object can disable and
-        # force-enable the automatic options handling.
         if provide_automatic_options is None:
             provide_automatic_options = getattr(
                 view_func, "provide_automatic_options", None
             )
 
-        if provide_automatic_options is None:
-            if "OPTIONS" not in methods and self.config["PROVIDE_AUTOMATIC_OPTIONS"]:
-                provide_automatic_options = True
-                required_methods.add("OPTIONS")
-            else:
-                provide_automatic_options = False
+            if provide_automatic_options is None:
+                provide_automatic_options = (
+                    "OPTIONS" not in methods
+                    and self.config["PROVIDE_AUTOMATIC_OPTIONS"]
+                )
+
+        if provide_automatic_options:
+            required_methods.add("OPTIONS")
 
         # Add the required methods now.
         methods |= required_methods
@@ -660,21 +661,34 @@ class App(Scaffold):
                 )
             self.view_functions[endpoint] = view_func
 
-    @setupmethod
+    @t.overload
+    def template_filter(self, name: T_template_filter) -> T_template_filter: ...
+    @t.overload
     def template_filter(
         self, name: str | None = None
-    ) -> t.Callable[[T_template_filter], T_template_filter]:
-        """A decorator that is used to register custom template filter.
-        You can specify a name for the filter, otherwise the function
-        name will be used. Example::
+    ) -> t.Callable[[T_template_filter], T_template_filter]: ...
+    @setupmethod
+    def template_filter(
+        self, name: T_template_filter | str | None = None
+    ) -> T_template_filter | t.Callable[[T_template_filter], T_template_filter]:
+        """Decorate a function to register it as a custom Jinja filter. The name
+        is optional. The decorator may be used without parentheses.
 
-          @app.template_filter()
-          def reverse(s):
-              return s[::-1]
+        .. code-block:: python
 
-        :param name: the optional name of the filter, otherwise the
-                     function name will be used.
+            @app.template_filter("reverse")
+            def reverse_filter(s):
+                return reversed(s)
+
+        The :meth:`add_template_filter` method may be used to register a
+        function later rather than decorating.
+
+        :param name: The name to register the filter as. If not given, uses the
+            function's name.
         """
+        if callable(name):
+            self.add_template_filter(name)
+            return name
 
         def decorator(f: T_template_filter) -> T_template_filter:
             self.add_template_filter(f, name=name)
@@ -686,36 +700,52 @@ class App(Scaffold):
     def add_template_filter(
         self, f: ft.TemplateFilterCallable, name: str | None = None
     ) -> None:
-        """Register a custom template filter.  Works exactly like the
-        :meth:`template_filter` decorator.
+        """Register a function to use as a custom Jinja filter.
 
-        :param name: the optional name of the filter, otherwise the
-                     function name will be used.
+        The :meth:`template_filter` decorator can be used to register a function
+        by decorating instead.
+
+        :param f: The function to register.
+        :param name: The name to register the filter as. If not given, uses the
+            function's name.
         """
         self.jinja_env.filters[name or f.__name__] = f
 
-    @setupmethod
+    @t.overload
+    def template_test(self, name: T_template_test) -> T_template_test: ...
+    @t.overload
     def template_test(
         self, name: str | None = None
-    ) -> t.Callable[[T_template_test], T_template_test]:
-        """A decorator that is used to register custom template test.
-        You can specify a name for the test, otherwise the function
-        name will be used. Example::
+    ) -> t.Callable[[T_template_test], T_template_test]: ...
+    @setupmethod
+    def template_test(
+        self, name: T_template_test | str | None = None
+    ) -> T_template_test | t.Callable[[T_template_test], T_template_test]:
+        """Decorate a function to register it as a custom Jinja test. The name
+        is optional. The decorator may be used without parentheses.
 
-          @app.template_test()
-          def is_prime(n):
-              if n == 2:
-                  return True
-              for i in range(2, int(math.ceil(math.sqrt(n))) + 1):
-                  if n % i == 0:
-                      return False
+        .. code-block:: python
+
+            @app.template_test("prime")
+            def is_prime_test(n):
+                if n == 2:
+                    return True
+                for i in range(2, int(math.ceil(math.sqrt(n))) + 1):
+                    if n % i == 0:
+                        return False
               return True
 
-        .. versionadded:: 0.10
+        The :meth:`add_template_test` method may be used to register a function
+        later rather than decorating.
 
-        :param name: the optional name of the test, otherwise the
-                     function name will be used.
+        :param name: The name to register the filter as. If not given, uses the
+            function's name.
+
+        .. versionadded:: 0.10
         """
+        if callable(name):
+            self.add_template_test(name)
+            return name
 
         def decorator(f: T_template_test) -> T_template_test:
             self.add_template_test(f, name=name)
@@ -727,33 +757,49 @@ class App(Scaffold):
     def add_template_test(
         self, f: ft.TemplateTestCallable, name: str | None = None
     ) -> None:
-        """Register a custom template test.  Works exactly like the
-        :meth:`template_test` decorator.
+        """Register a function to use as a custom Jinja test.
+
+        The :meth:`template_test` decorator can be used to register a function
+        by decorating instead.
+
+        :param f: The function to register.
+        :param name: The name to register the test as. If not given, uses the
+            function's name.
 
         .. versionadded:: 0.10
-
-        :param name: the optional name of the test, otherwise the
-                     function name will be used.
         """
         self.jinja_env.tests[name or f.__name__] = f
 
-    @setupmethod
+    @t.overload
+    def template_global(self, name: T_template_global) -> T_template_global: ...
+    @t.overload
     def template_global(
         self, name: str | None = None
-    ) -> t.Callable[[T_template_global], T_template_global]:
-        """A decorator that is used to register a custom template global function.
-        You can specify a name for the global function, otherwise the function
-        name will be used. Example::
+    ) -> t.Callable[[T_template_global], T_template_global]: ...
+    @setupmethod
+    def template_global(
+        self, name: T_template_global | str | None = None
+    ) -> T_template_global | t.Callable[[T_template_global], T_template_global]:
+        """Decorate a function to register it as a custom Jinja global. The name
+        is optional. The decorator may be used without parentheses.
 
-            @app.template_global()
+        .. code-block:: python
+
+            @app.template_global
             def double(n):
                 return 2 * n
 
-        .. versionadded:: 0.10
+        The :meth:`add_template_global` method may be used to register a
+        function later rather than decorating.
 
-        :param name: the optional name of the global function, otherwise the
-                     function name will be used.
+        :param name: The name to register the global as. If not given, uses the
+            function's name.
+
+        .. versionadded:: 0.10
         """
+        if callable(name):
+            self.add_template_global(name)
+            return name
 
         def decorator(f: T_template_global) -> T_template_global:
             self.add_template_global(f, name=name)
@@ -765,22 +811,24 @@ class App(Scaffold):
     def add_template_global(
         self, f: ft.TemplateGlobalCallable, name: str | None = None
     ) -> None:
-        """Register a custom template global function. Works exactly like the
-        :meth:`template_global` decorator.
+        """Register a function to use as a custom Jinja global.
+
+        The :meth:`template_global` decorator can be used to register a function
+        by decorating instead.
+
+        :param f: The function to register.
+        :param name: The name to register the global as. If not given, uses the
+            function's name.
 
         .. versionadded:: 0.10
-
-        :param name: the optional name of the global function, otherwise the
-                     function name will be used.
         """
         self.jinja_env.globals[name or f.__name__] = f
 
     @setupmethod
     def teardown_appcontext(self, f: T_teardown) -> T_teardown:
-        """Registers a function to be called when the application
-        context is popped. The application context is typically popped
-        after the request context for each request, at the end of CLI
-        commands, or after a manually pushed context ends.
+        """Registers a function to be called when the app context is popped. The
+        context is popped at the end of a request, CLI command, or manual ``with``
+        block.
 
         .. code-block:: python
 
@@ -789,9 +837,7 @@ class App(Scaffold):
 
         When the ``with`` block exits (or ``ctx.pop()`` is called), the
         teardown functions are called just before the app context is
-        made inactive. Since a request context typically also manages an
-        application context it would also be called when you pop a
-        request context.
+        made inactive.
 
         When a teardown function was called because of an unhandled
         exception it will be passed an error object. If an
@@ -880,17 +926,18 @@ class App(Scaffold):
 
         return False
 
-    def should_ignore_error(self, error: BaseException | None) -> bool:
-        """This is called to figure out if an error should be ignored
-        or not as far as the teardown system is concerned.  If this
-        function returns ``True`` then the teardown handlers will not be
-        passed the error.
+    should_ignore_error: None = None
+    """If this method returns ``True``, the error will not be passed to
+    teardown handlers, and the context will not be preserved for
+    debugging.
 
-        .. versionadded:: 0.10
-        """
-        return False
+    .. deprecated:: 3.2
+        Handle errors as needed in teardown handlers instead.
 
-    def redirect(self, location: str, code: int = 302) -> BaseResponse:
+    .. versionadded:: 0.10
+    """
+
+    def redirect(self, location: str, code: int = 303) -> BaseResponse:
         """Create a redirect response object.
 
         This is called by :func:`flask.redirect`, and can be called
@@ -898,6 +945,9 @@ class App(Scaffold):
 
         :param location: The URL to redirect to.
         :param code: The status code for the redirect.
+
+        .. versionchanged:: 3.2
+            ``code`` defaults to ``303`` instead of ``302``.
 
         .. versionadded:: 2.2
             Moved from ``flask.redirect``, which calls this method.

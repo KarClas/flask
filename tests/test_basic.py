@@ -1,18 +1,20 @@
 import gc
+import importlib.metadata
 import re
 import typing as t
 import uuid
-import warnings
 import weakref
 from contextlib import nullcontext
 from datetime import datetime
-from datetime import timezone
+from datetime import UTC
+from functools import partial
 from platform import python_implementation
 
 import pytest
 import werkzeug.serving
 from markupsafe import Markup
 from werkzeug.exceptions import BadRequest
+from werkzeug.exceptions import BadRequestKeyError
 from werkzeug.exceptions import Forbidden
 from werkzeug.exceptions import NotFound
 from werkzeug.http import parse_date
@@ -20,7 +22,7 @@ from werkzeug.routing import BuildError
 from werkzeug.routing import RequestRedirect
 
 import flask
-from flask.globals import request_ctx
+from flask.globals import app_ctx
 from flask.testing import FlaskClient
 
 require_cpython_gc = pytest.mark.skipif(
@@ -52,10 +54,12 @@ def test_options_on_multiple_rules(app, client):
     assert sorted(rv.allow) == ["GET", "HEAD", "OPTIONS", "POST", "PUT"]
 
 
-@pytest.mark.parametrize("method", ["get", "post", "put", "delete", "patch"])
+@pytest.mark.parametrize("method", ["get", "query", "post", "put", "delete", "patch"])
 def test_method_route(app, client, method):
     method_route = getattr(app, method)
-    client_method = getattr(client, method)
+    client_method = getattr(
+        client, method, partial(client.open, method=method.capitalize())
+    )
 
     @method_route("/")
     def hello():
@@ -69,63 +73,61 @@ def test_method_route_no_methods(app):
         app.get("/", methods=["GET", "POST"])
 
 
-def test_provide_automatic_options_attr():
-    app = flask.Flask(__name__)
+def test_provide_automatic_options_attr_disable(
+    app: flask.Flask, client: FlaskClient
+) -> None:
+    """Automatic options can be disabled by the view func attribute."""
 
     def index():
         return "Hello World!"
 
     index.provide_automatic_options = False
-    app.route("/")(index)
-    rv = app.test_client().open("/", method="OPTIONS")
+    app.add_url_rule("/", view_func=index)
+    rv = client.options()
     assert rv.status_code == 405
 
-    app = flask.Flask(__name__)
 
-    def index2():
+def test_provide_automatic_options_attr_enable(
+    app: flask.Flask, client: FlaskClient
+) -> None:
+    """When default automatic options is disabled in config, it can still be
+    enabled by the view function attribute.
+    """
+    app.config["PROVIDE_AUTOMATIC_OPTIONS"] = False
+
+    def index():
         return "Hello World!"
 
-    index2.provide_automatic_options = True
-    app.route("/", methods=["OPTIONS"])(index2)
-    rv = app.test_client().open("/", method="OPTIONS")
-    assert sorted(rv.allow) == ["OPTIONS"]
+    index.provide_automatic_options = True
+    app.add_url_rule("/", view_func=index)
+    rv = client.options()
+    assert rv.allow == {"GET", "HEAD", "OPTIONS"}
 
 
-def test_provide_automatic_options_kwarg(app, client):
+def test_provide_automatic_options_arg_disable(
+    app: flask.Flask, client: FlaskClient
+) -> None:
+    """Automatic options can be disabled by the route argument."""
+
+    @app.get("/", provide_automatic_options=False)
     def index():
-        return flask.request.method
+        return "Hello World!"
 
-    def more():
-        return flask.request.method
-
-    app.add_url_rule("/", view_func=index, provide_automatic_options=False)
-    app.add_url_rule(
-        "/more",
-        view_func=more,
-        methods=["GET", "POST"],
-        provide_automatic_options=False,
-    )
-    assert client.get("/").data == b"GET"
-
-    rv = client.post("/")
-    assert rv.status_code == 405
-    assert sorted(rv.allow) == ["GET", "HEAD"]
-
-    rv = client.open("/", method="OPTIONS")
+    rv = client.options()
     assert rv.status_code == 405
 
-    rv = client.head("/")
-    assert rv.status_code == 200
-    assert not rv.data  # head truncates
-    assert client.post("/more").data == b"POST"
-    assert client.get("/more").data == b"GET"
 
-    rv = client.delete("/more")
-    assert rv.status_code == 405
-    assert sorted(rv.allow) == ["GET", "HEAD", "POST"]
+def test_provide_automatic_options_method_disable(
+    app: flask.Flask, client: FlaskClient
+) -> None:
+    """Automatic options is ignored if the route handles options."""
 
-    rv = client.open("/more", method="OPTIONS")
-    assert rv.status_code == 405
+    @app.route("/", methods=["OPTIONS"])
+    def index():
+        return "", {"X-Test": "test"}
+
+    rv = client.options()
+    assert rv.headers["X-Test"] == "test"
 
 
 def test_request_dispatching(app, client):
@@ -250,29 +252,29 @@ def test_session_accessed(app: flask.Flask, client: FlaskClient) -> None:
     with client:
         rv = client.get("/nothing")
         assert "cookie" not in rv.vary
-        assert not request_ctx._session.accessed
-        assert not request_ctx._session.modified
+        assert not app_ctx._session.accessed
+        assert not app_ctx._session.modified
 
     with client:
         rv = client.post(data={"value": "42"})
         assert rv.text == "value set"
         assert "cookie" in rv.vary
-        assert request_ctx._session.accessed
-        assert request_ctx._session.modified
+        assert app_ctx._session.accessed
+        assert app_ctx._session.modified
 
     with client:
         rv = client.get()
         assert rv.text == "42"
         assert "cookie" in rv.vary
-        assert request_ctx._session.accessed
-        assert not request_ctx._session.modified
+        assert app_ctx._session.accessed
+        assert not app_ctx._session.modified
 
     with client:
         rv = client.get("/nothing")
         assert rv.text == ""
         assert "cookie" not in rv.vary
-        assert not request_ctx._session.accessed
-        assert not request_ctx._session.modified
+        assert not app_ctx._session.accessed
+        assert not app_ctx._session.modified
 
 
 def test_session_path(app, client):
@@ -437,7 +439,7 @@ def test_session_expiration(app, client):
     assert "set-cookie" in rv.headers
     match = re.search(r"(?i)\bexpires=([^;]+)", rv.headers["set-cookie"])
     expires = parse_date(match.group())
-    expected = datetime.now(timezone.utc) + app.permanent_session_lifetime
+    expected = datetime.now(UTC) + app.permanent_session_lifetime
     assert expires.year == expected.year
     assert expires.month == expected.month
     assert expires.day == expected.day
@@ -467,7 +469,7 @@ def test_session_stored_last(app, client):
 
 
 def test_session_special_types(app, client):
-    now = datetime.now(timezone.utc).replace(microsecond=0)
+    now = datetime.now(UTC).replace(microsecond=0)
     the_uuid = uuid.uuid4()
 
     @app.route("/")
@@ -1071,11 +1073,10 @@ def test_trap_bad_request_key_error(app, client, debug, trap, expect_key, expect
         assert rv.status_code == 400
         assert b"missing_key" not in rv.data
     else:
-        with pytest.raises(KeyError) as exc_info:
+        with pytest.raises(BadRequestKeyError) as exc_info:
             client.get("/key")
 
-        assert exc_info.errisinstance(BadRequest)
-        assert "missing_key" in exc_info.value.get_description()
+        assert "missing_key" in exc_info.value.get_response().get_data(as_text=True)
 
     if expect_abort:
         rv = client.get("/abort")
@@ -1422,20 +1423,21 @@ def test_url_for_passes_special_values_to_build_error_handler(app):
 
 
 def test_static_files(app, client):
-    rv = client.get("/static/index.html")
-    assert rv.status_code == 200
-    assert rv.data.strip() == b"<h1>Hello World!</h1>"
-    with app.test_request_context():
-        assert flask.url_for("static", filename="index.html") == "/static/index.html"
-    rv.close()
+    with client.get("/static/index.html") as rv:
+        assert rv.status_code == 200
+        assert rv.data.strip() == b"<h1>Hello World!</h1>"
+        with app.test_request_context():
+            assert (
+                flask.url_for("static", filename="index.html") == "/static/index.html"
+            )
 
 
 def test_static_url_path():
     app = flask.Flask(__name__, static_url_path="/foo")
     app.testing = True
-    rv = app.test_client().get("/foo/index.html")
-    assert rv.status_code == 200
-    rv.close()
+
+    with app.test_client().get("/foo/index.html") as rv:
+        assert rv.status_code == 200
 
     with app.test_request_context():
         assert flask.url_for("static", filename="index.html") == "/foo/index.html"
@@ -1444,9 +1446,9 @@ def test_static_url_path():
 def test_static_url_path_with_ending_slash():
     app = flask.Flask(__name__, static_url_path="/foo/")
     app.testing = True
-    rv = app.test_client().get("/foo/index.html")
-    assert rv.status_code == 200
-    rv.close()
+
+    with app.test_client().get("/foo/index.html") as rv:
+        assert rv.status_code == 200
 
     with app.test_request_context():
         assert flask.url_for("static", filename="index.html") == "/foo/index.html"
@@ -1454,25 +1456,25 @@ def test_static_url_path_with_ending_slash():
 
 def test_static_url_empty_path(app):
     app = flask.Flask(__name__, static_folder="", static_url_path="")
-    rv = app.test_client().open("/static/index.html", method="GET")
-    assert rv.status_code == 200
-    rv.close()
+
+    with app.test_client().open("/static/index.html", method="GET") as rv:
+        assert rv.status_code == 200
 
 
 def test_static_url_empty_path_default(app):
     app = flask.Flask(__name__, static_folder="")
-    rv = app.test_client().open("/static/index.html", method="GET")
-    assert rv.status_code == 200
-    rv.close()
+
+    with app.test_client().open("/static/index.html", method="GET") as rv:
+        assert rv.status_code == 200
 
 
 def test_static_folder_with_pathlib_path(app):
     from pathlib import Path
 
     app = flask.Flask(__name__, static_folder=Path("static"))
-    rv = app.test_client().open("/static/index.html", method="GET")
-    assert rv.status_code == 200
-    rv.close()
+
+    with app.test_client().open("/static/index.html", method="GET") as rv:
+        assert rv.status_code == 200
 
 
 def test_static_folder_with_ending_slash():
@@ -1489,9 +1491,10 @@ def test_static_folder_with_ending_slash():
 def test_static_route_with_host_matching():
     app = flask.Flask(__name__, host_matching=True, static_host="example.com")
     c = app.test_client()
-    rv = c.get("http://example.com/static/index.html")
-    assert rv.status_code == 200
-    rv.close()
+
+    with c.get("http://example.com/static/index.html") as rv:
+        assert rv.status_code == 200
+
     with app.test_request_context():
         rv = flask.url_for("static", filename="index.html", _external=True)
         assert rv == "http://example.com/static/index.html"
@@ -1512,20 +1515,22 @@ def test_request_locals():
     assert not flask.g
 
 
+werkzeug_3_2 = importlib.metadata.version("werkzeug") >= "3.2."
+
+
 @pytest.mark.parametrize(
-    ("subdomain_matching", "host_matching", "expect_base", "expect_abc", "expect_xyz"),
+    ("subdomain_matching", "host_matching", "expect_subdomain", "expect_host"),
     [
-        (False, False, "default", "default", "default"),
-        (True, False, "default", "abc", "<invalid>"),
-        (False, True, "default", "abc", "default"),
+        (False, False, "default", "default"),
+        (True, False, "abc", "<invalid>"),
+        (False, True, "abc", "default"),
     ],
 )
 def test_server_name_matching(
     subdomain_matching: bool,
     host_matching: bool,
-    expect_base: str,
-    expect_abc: str,
-    expect_xyz: str,
+    expect_subdomain: str,
+    expect_host: str,
 ) -> None:
     app = flask.Flask(
         __name__,
@@ -1543,15 +1548,18 @@ def test_server_name_matching(
     client = app.test_client()
 
     r = client.get(base_url="http://example.test")
-    assert r.text == expect_base
+    assert r.text == "default"
 
     r = client.get(base_url="http://abc.example.test")
-    assert r.text == expect_abc
+    assert r.text == expect_subdomain
 
     with pytest.warns() if subdomain_matching else nullcontext():
         r = client.get(base_url="http://xyz.other.test")
 
-    assert r.text == expect_xyz
+        if werkzeug_3_2:
+            assert r.text == "default"
+        else:
+            assert r.text == expect_host
 
 
 def test_server_name_subdomain():
@@ -1587,12 +1595,12 @@ def test_server_name_subdomain():
     rv = client.get("/", "https://dev.local")
     assert rv.data == b"default"
 
-    # suppress Werkzeug 0.15 warning about name mismatch
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore", "Current server name", UserWarning, "flask.app"
-        )
+    with pytest.warns(match="Current server name"):
         rv = client.get("/", "http://foo.localhost")
+
+    if werkzeug_3_2:
+        assert rv.status_code == 200
+    else:
         assert rv.status_code == 404
 
     rv = client.get("/", "http://foo.dev.local")
@@ -1828,13 +1836,13 @@ def test_subdomain_matching_other_name(matching):
     def index():
         return "", 204
 
-    # suppress Werkzeug 0.15 warning about name mismatch
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore", "Current server name", UserWarning, "flask.app"
-        )
-        # ip address can't match name
+    with pytest.warns(match="Current server name") if matching else nullcontext():
+        # ip address can't match name, but will fall back to default
         rv = client.get("/", "http://127.0.0.1:3000/")
+
+    if werkzeug_3_2:
+        assert rv.status_code == 204
+    else:
         assert rv.status_code == 404 if matching else 204
 
     # allow all subdomains if matching is disabled
@@ -1905,6 +1913,7 @@ def test_run_server_port(monkeypatch, app):
         ("localhost", 0, "localhost:8080", "localhost", 0),
         (None, None, "localhost:8080", "localhost", 8080),
         (None, None, "localhost:0", "localhost", 0),
+        (None, None, "[::1]:8080", "::1", 8080),
     ),
 )
 def test_run_from_config(

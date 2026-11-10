@@ -2,7 +2,7 @@ import pytest
 
 import flask
 from flask.globals import app_ctx
-from flask.globals import request_ctx
+from flask.testing import FlaskClient
 
 
 def test_basic_url_generation(app):
@@ -107,7 +107,8 @@ def test_app_tearing_down_with_handled_exception_by_app_handler(app, client):
     with app.app_context():
         client.get("/")
 
-    assert cleanup_stuff == [None]
+    # teardown request context, and with block context
+    assert cleanup_stuff == [None, None]
 
 
 def test_app_tearing_down_with_unhandled_exception(app, client):
@@ -126,9 +127,11 @@ def test_app_tearing_down_with_unhandled_exception(app, client):
         with app.app_context():
             client.get("/")
 
-    assert len(cleanup_stuff) == 1
+    assert len(cleanup_stuff) == 2
     assert isinstance(cleanup_stuff[0], ValueError)
     assert str(cleanup_stuff[0]) == "dummy"
+    # exception propagated, seen by request context and with block context
+    assert cleanup_stuff[0] is cleanup_stuff[1]
 
 
 def test_app_ctx_globals_methods(app, app_ctx):
@@ -178,8 +181,7 @@ def test_context_refcounts(app, client):
     @app.route("/")
     def index():
         with app_ctx:
-            with request_ctx:
-                pass
+            pass
 
         assert flask.request.environ["werkzeug.request"] is not None
         return ""
@@ -207,3 +209,51 @@ def test_clean_pop(app):
 
     assert called == ["flask_test", "TEARDOWN"]
     assert not flask.current_app
+
+
+def test_robust_teardown(app: flask.Flask, client: FlaskClient) -> None:
+    count = 0
+
+    @app.teardown_request
+    def request_teardown(e: Exception | None) -> None:
+        nonlocal count
+        count += 1
+        raise ValueError("request_teardown")
+
+    @app.teardown_appcontext
+    def app_teardown(e: Exception | None) -> None:
+        nonlocal count
+        count += 1
+        raise ValueError("app_teardown")
+
+    @app.get("/")
+    def index() -> str:
+        return ""
+
+    def request_signal(sender: flask.Flask, exc: Exception | None) -> None:
+        nonlocal count
+        count += 1
+        raise ValueError("request_signal")
+
+    def app_signal(sender: flask.Flask, exc: Exception | None) -> None:
+        nonlocal count
+        count += 1
+        raise ValueError("app_signal")
+
+    with (
+        flask.request_tearing_down.connected_to(request_signal, app),
+        flask.appcontext_tearing_down.connected_to(app_signal, app),
+    ):
+        with pytest.raises(ExceptionGroup, match="context teardown") as exc_info:  # noqa: F821
+            client.get()
+
+        assert len(exc_info.value.exceptions) == 2
+        eg1, eg2 = exc_info.value.exceptions
+        assert isinstance(eg1, ExceptionGroup)  # noqa: F821
+        assert "request teardown" in eg1.message
+        assert len(eg1.exceptions) == 2
+        assert isinstance(eg2, ExceptionGroup)  # noqa: F821
+        assert "app teardown" in eg2.message
+        assert len(eg2.exceptions) == 2
+
+    assert count == 4

@@ -2,43 +2,26 @@ import os
 import sys
 
 import pytest
-from _pytest import monkeypatch
 
 from flask import Flask
-from flask.globals import request_ctx
-
-
-@pytest.fixture(scope="session", autouse=True)
-def _standard_os_environ():
-    """Set up ``os.environ`` at the start of the test session to have
-    standard values. Returns a list of operations that is used by
-    :func:`._reset_os_environ` after each test.
-    """
-    mp = monkeypatch.MonkeyPatch()
-    out = (
-        (os.environ, "FLASK_ENV_FILE", monkeypatch.notset),
-        (os.environ, "FLASK_APP", monkeypatch.notset),
-        (os.environ, "FLASK_DEBUG", monkeypatch.notset),
-        (os.environ, "FLASK_RUN_FROM_CLI", monkeypatch.notset),
-        (os.environ, "WERKZEUG_RUN_MAIN", monkeypatch.notset),
-    )
-
-    for _, key, value in out:
-        if value is monkeypatch.notset:
-            mp.delenv(key, False)
-        else:
-            mp.setenv(key, value)
-
-    yield out
-    mp.undo()
+from flask.globals import app_ctx as _app_ctx
 
 
 @pytest.fixture(autouse=True)
-def _reset_os_environ(monkeypatch, _standard_os_environ):
-    """Reset ``os.environ`` to the standard environ after each test,
-    in case a test changed something without cleaning up.
+def _standard_os_environ(monkeypatch):
+    """Set up ``os.environ`` at the start of every test to have
+    standard values.
     """
-    monkeypatch._setitem.extend(_standard_os_environ)
+    for key in (
+        "FLASK_ENV_FILE",
+        "FLASK_APP",
+        "FLASK_DEBUG",
+        "FLASK_RUN_FROM_CLI",
+        "WERKZEUG_RUN_MAIN",
+    ):
+        monkeypatch.delenv(key, False)
+
+    yield
 
 
 @pytest.fixture
@@ -83,16 +66,17 @@ def test_apps(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def leak_detector():
+    """Fails if any app contexts are still pushed when a test ends. Pops all
+    contexts so subsequent tests are not affected.
+    """
     yield
-
-    # make sure we're not leaking a request context since we are
-    # testing flask internally in debug mode in a few cases
     leaks = []
-    while request_ctx:
-        leaks.append(request_ctx._get_current_object())
-        request_ctx.pop()
 
-    assert leaks == []
+    while _app_ctx:
+        leaks.append(_app_ctx._get_current_object())
+        _app_ctx.pop()
+
+    assert not leaks
 
 
 @pytest.fixture
